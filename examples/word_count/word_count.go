@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -35,11 +36,17 @@ func (w wordCount) Reduce(key string, values corral.ValueIterator, emitter corra
 }
 
 func main() {
+	fmt.Println("main start, print args:")
+	for idx, arg := range os.Args {
+		fmt.Println("arg"+strconv.Itoa(idx)+": ", arg)
+	}
 	job := corral.NewJob(wordCount{}, wordCount{})
 
 	options := []corral.Option{
 		corral.WithSplitSize(10 * 1024),
 		corral.WithMapBinSize(10 * 1024),
+		corral.WithLambdaFuncName("WordCountFunc"),
+		corral.WithNumReduce(10),
 	}
 
 	driver := corral.NewDriver(job, options...)

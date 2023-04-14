@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,8 +27,10 @@ type Job struct {
 	intermediateBins uint
 	outputPath       string
 
-	bytesRead    int64
-	bytesWritten int64
+	mapBytesRead       int64
+	mapBytesWritten    int64
+	reduceBytesRead    int64
+	reduceBytesWritten int64
 }
 
 // Logic for running a single map task
@@ -44,7 +47,7 @@ func (j *Job) runMapper(mapperID uint, splits []inputSplit) error {
 		}
 	}
 
-	atomic.AddInt64(&j.bytesWritten, emitter.bytesWritten())
+	atomic.AddInt64(&j.mapBytesWritten, emitter.bytesWritten())
 
 	return emitter.close()
 }
@@ -95,7 +98,7 @@ func (j *Job) runMapperSplit(split inputSplit, emitter Emitter) error {
 		}
 	}
 
-	atomic.AddInt64(&j.bytesRead, bytesRead)
+	atomic.AddInt64(&j.mapBytesRead, bytesRead)
 
 	return nil
 }
@@ -127,21 +130,40 @@ func (j *Job) runReducer(binID uint) error {
 			return err
 		}
 
-		// Feed intermediate data into reducers
-		decoder := json.NewDecoder(reader)
-		for decoder.More() {
-			var kv keyValue
-			if err := decoder.Decode(&kv); err != nil {
-				return err
-			}
+		if shuffleOutType == "json" {
+			//json格式序列化
+			//Feed intermediate data into reducers
+			decoder := json.NewDecoder(reader)
+			for decoder.More() {
+				var kv keyValue
+				if err := decoder.Decode(&kv); err != nil {
+					return err
+				}
 
-			if _, ok := data[kv.Key]; !ok {
-				data[kv.Key] = make([]string, 0)
-			}
+				if _, ok := data[kv.Key]; !ok {
+					data[kv.Key] = make([]string, 0)
+				}
 
-			data[kv.Key] = append(data[kv.Key], kv.Value)
+				data[kv.Key] = append(data[kv.Key], kv.Value)
+			}
+			reader.Close()
+		} else {
+			// 按行读取
+			lineReader := bufio.NewReader(reader)
+			for {
+				line, _, err := lineReader.ReadLine()
+				if err == io.EOF {
+					break
+				}
+				kv := strings.Split(string(line), "\t")
+				if _, ok := data[kv[0]]; !ok {
+					data[kv[0]] = make([]string, 0)
+				}
+
+				data[kv[0]] = append(data[kv[0]], kv[1])
+			}
+			reader.Close()
 		}
-		reader.Close()
 
 		// Delete intermediate map data
 		if j.config.Cleanup {
@@ -180,8 +202,8 @@ func (j *Job) runReducer(binID uint) error {
 
 	waitGroup.Wait()
 
-	atomic.AddInt64(&j.bytesWritten, emitter.bytesWritten())
-	atomic.AddInt64(&j.bytesRead, bytesRead)
+	atomic.AddInt64(&j.reduceBytesWritten, emitter.bytesWritten())
+	atomic.AddInt64(&j.reduceBytesRead, bytesRead)
 
 	return nil
 }
@@ -218,10 +240,12 @@ func (j *Job) inputSplits(inputs []string, maxSplitSize int64) []inputSplit {
 		log.Debugf("Average split size: %s bytes", humanize.Bytes(uint64(totalSize)/uint64(len(splits))))
 	}
 
-	j.intermediateBins = uint(float64(totalSize/j.config.ReduceBinSize) * 1.25)
-	if j.intermediateBins == 0 {
-		j.intermediateBins = 1
-	}
+	j.intermediateBins = uint(j.config.NumReduce)
+	//
+	//j.intermediateBins = uint(float64(totalSize/j.config.ReduceBinSize) * 1.25)
+	//if j.intermediateBins == 0 {
+	//	j.intermediateBins = 1
+	//}
 
 	return splits
 }

@@ -20,7 +20,7 @@ func loadConfig() {
 func setupDefaults() {
 	defaultSettings := map[string]interface{}{
 		"lambdaFunctionName": "corral_function",
-		"lambdaMemory":       1500,
+		"lambdaMemory":       150,
 		"lambdaTimeout":      180,
 		"lambdaManageRole":   true,
 		"cleanup":            true,
@@ -30,6 +30,7 @@ func setupDefaults() {
 		"reduceBinSize":      512 * 1024 * 1024, // Default reduce bin size is 512Mb
 		"maxConcurrency":     500,               // Maximum number of concurrent executors
 		"workingLocation":    ".",
+		"numReduce":          1,
 	}
 	for key, value := range defaultSettings {
 		viper.SetDefault(key, value)

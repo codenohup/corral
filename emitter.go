@@ -4,13 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	log "github.com/sirupsen/logrus"
 	"hash/fnv"
 	"io"
 	"strings"
 	"sync"
 
 	"github.com/bcongdon/corral/internal/pkg/corfs"
-	log "github.com/sirupsen/logrus"
 )
 
 // Emitter enables mappers and reducers to yield key-value pairs.
@@ -103,19 +103,28 @@ func (me *mapperEmitter) Emit(key, value string) error {
 		me.writers[bin] = writer
 	}
 
-	kv := keyValue{
-		Key:   key,
-		Value: value,
-	}
+	var err error
+	var n int
+	if shuffleOutType == "json" {
+		// JSON格式的序列化
+		kv := keyValue{
+			Key:   key,
+			Value: value,
+		}
 
-	data, err := json.Marshal(kv)
-	if err != nil {
-		log.Error(err)
-		return err
-	}
+		data, err := json.Marshal(kv)
+		if err != nil {
+			log.Error(err)
+			return err
+		}
 
-	data = append(data, '\n')
-	_, err = writer.Write(data)
+		data = append(data, '\n')
+		n, err = writer.Write(data)
+		me.writtenBytes += int64(n)
+	} else {
+		n, err = writer.Write([]byte(fmt.Sprintf("%s\t%s\n", key, value)))
+		me.writtenBytes += int64(n)
+	}
 	return err
 }
 

@@ -22,10 +22,10 @@ func TestNewDriver(t *testing.T) {
 	)
 
 	assert.Equal(t, j, driver.jobs[0])
-	assert.Equal(t, int64(100), driver.config.SplitSize)
-	assert.Equal(t, int64(200), driver.config.MapBinSize)
-	assert.Equal(t, int64(300), driver.config.ReduceBinSize)
-	assert.Equal(t, "s3://foo", driver.config.WorkingLocation)
+	assert.Equal(t, int64(100), driver.Config.SplitSize)
+	assert.Equal(t, int64(200), driver.Config.MapBinSize)
+	assert.Equal(t, int64(300), driver.Config.ReduceBinSize)
+	assert.Equal(t, "s3://foo", driver.Config.WorkingLocation)
 }
 
 type testWCJob struct{}

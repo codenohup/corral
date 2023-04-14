@@ -18,8 +18,11 @@ test_wc_local: $(PROG_NAME)
 test_wc_s3: $(PROG_NAME) input_in_s3
 	$(BIN_DIR)/$(PROG_NAME) --out s3://${BUCKET}/ s3://${BUCKET}/metamorphosis.txt
 
-test_wc_lambda: $(PROG_NAME) input_in_s3
-	$(BIN_DIR)/$(PROG_NAME) --lambda --out s3://${BUCKET}/ s3://${BUCKET}/metamorphosis.txt
+#test_wc_lambda: $(PROG_NAME) input_in_s3
+#	$(BIN_DIR)/$(PROG_NAME) --lambda --out s3://${BUCKET}/ s3://${BUCKET}/metamorphosis.txt
+
+test_wc_lambda: $(PROG_NAME)
+	$(BIN_DIR)/$(PROG_NAME) --lambda --verbose --out s3://huangxu/wordcount/output/ s3://huangxu/wordcount/input/
 
 clean:
 	find . -name "*.out" -print0 | xargs -0 rm

@@ -23,10 +23,14 @@ import (
 	flag "github.com/spf13/pflag"
 )
 
+const (
+	shuffleOutType = "line" // "line", Shuffle数据按行输出，key`\tab`val; "json": Shuffle数据按json格式输出
+)
+
 // Driver controls the execution of a MapReduce Job
 type Driver struct {
 	jobs     []*Job
-	config   *config
+	Config   *config
 	executor executor
 }
 
@@ -39,6 +43,7 @@ type config struct {
 	MaxConcurrency  int
 	WorkingLocation string
 	Cleanup         bool
+	NumReduce       int
 }
 
 func newConfig() *config {
@@ -56,6 +61,7 @@ func newConfig() *config {
 		MaxConcurrency:  viper.GetInt("maxConcurrency"),
 		WorkingLocation: viper.GetString("workingLocation"),
 		Cleanup:         viper.GetBool("cleanup"),
+		NumReduce:       viper.GetInt("numReduce"),
 	}
 }
 
@@ -79,7 +85,7 @@ func NewDriver(job *Job, options ...Option) *Driver {
 		c.SplitSize = c.MapBinSize
 	}
 
-	d.config = c
+	d.Config = c
 	log.Debugf("Loaded config: %#v", c)
 
 	return d
@@ -127,20 +133,35 @@ func WithInputs(inputs ...string) Option {
 	}
 }
 
+// Set lambda function name
+func WithLambdaFuncName(funcName string) Option {
+	return func(c *config) {
+		viper.Set("lambdaFunctionName", funcName)
+	}
+}
+
+// Set reduce funtion number
+func WithNumReduce(num int) Option {
+	return func(c *config) {
+		viper.Set("numReduce", num)
+		c.NumReduce = num
+	}
+}
+
 func (d *Driver) runMapPhase(job *Job, jobNumber int, inputs []string) {
-	inputSplits := job.inputSplits(inputs, d.config.SplitSize)
+	inputSplits := job.inputSplits(inputs, d.Config.SplitSize)
 	if len(inputSplits) == 0 {
 		log.Warnf("No input splits")
 		return
 	}
 	log.Debugf("Number of job input splits: %d", len(inputSplits))
 
-	inputBins := packInputSplits(inputSplits, d.config.MapBinSize)
+	inputBins := packInputSplits(inputSplits, d.Config.MapBinSize)
 	log.Debugf("Number of job input bins: %d", len(inputBins))
 	bar := pb.New(len(inputBins)).Prefix("Map").Start()
 
 	var wg sync.WaitGroup
-	sem := semaphore.NewWeighted(int64(d.config.MaxConcurrency))
+	sem := semaphore.NewWeighted(int64(d.Config.MaxConcurrency))
 	for binID, bin := range inputBins {
 		sem.Acquire(context.Background(), 1)
 		wg.Add(1)
@@ -183,20 +204,23 @@ func (d *Driver) run() {
 		lambda.Start(handleRequest)
 	}
 	if lBackend, ok := d.executor.(*lambdaExecutor); ok {
+		start := time.Now()
 		lBackend.Deploy()
+		end := time.Now()
+		fmt.Printf("Deply function Time: %s\n", viper.GetString("lambdaFunctionName"), end.Sub(start))
 	}
 
-	if len(d.config.Inputs) == 0 {
+	if len(d.Config.Inputs) == 0 {
 		log.Error("No inputs!")
 		return
 	}
 
-	inputs := d.config.Inputs
+	inputs := d.Config.Inputs
 	for idx, job := range d.jobs {
 		// Initialize job filesystem
 		job.fileSystem = corfs.InferFilesystem(inputs[0])
 
-		jobWorkingLoc := d.config.WorkingLocation
+		jobWorkingLoc := d.Config.WorkingLocation
 		log.Infof("Starting job%d (%d/%d)", idx, idx+1, len(d.jobs))
 
 		if len(d.jobs) > 1 {
@@ -204,15 +228,25 @@ func (d *Driver) run() {
 		}
 		job.outputPath = jobWorkingLoc
 
-		*job.config = *d.config
+		*job.config = *d.Config
+
+		mapStart := time.Now()
 		d.runMapPhase(job, idx, inputs)
+		mapEnd := time.Now()
+		fmt.Printf("Job%d (%d/%d) Map State Execution Time: %s\n", idx, idx+1, len(d.jobs), mapEnd.Sub(mapStart))
+
+		reduceStart := time.Now()
 		d.runReducePhase(job, idx)
+		reduceEnd := time.Now()
+		fmt.Printf("Job%d (%d/%d) Reduce State Execution Time: %s\n", idx, idx+1, len(d.jobs), reduceEnd.Sub(reduceStart))
 
 		// Set inputs of next job to be outputs of current job
 		inputs = []string{job.fileSystem.Join(jobWorkingLoc, "output-*")}
 
-		log.Infof("Job %d - Total Bytes Read:\t%s", idx, humanize.Bytes(uint64(job.bytesRead)))
-		log.Infof("Job %d - Total Bytes Written:\t%s", idx, humanize.Bytes(uint64(job.bytesWritten)))
+		log.Infof("Job %d - Map Bytes Read:\t%s", idx, humanize.Bytes(uint64(job.mapBytesRead)))
+		log.Infof("Job %d - Map Bytes Written:\t%s", idx, humanize.Bytes(uint64(job.mapBytesWritten)))
+		log.Infof("Job %d - Reduce Bytes Read:\t%s", idx, humanize.Bytes(uint64(job.reduceBytesRead)))
+		log.Infof("Job %d - Reduce Bytes Written:\t%s", idx, humanize.Bytes(uint64(job.reduceBytesWritten)))
 	}
 }
 
@@ -221,6 +255,9 @@ var outputDir = flag.StringP("out", "o", "", "Output `directory` (can be local o
 var memprofile = flag.String("memprofile", "", "Write memory profile to `file`")
 var verbose = flag.BoolP("verbose", "v", false, "Output verbose logs")
 var undeploy = flag.Bool("undeploy", false, "Undeploy the Lambda function and IAM permissions without running the driver")
+var cleanup = flag.Bool("cleanup", true, "Whether delete shuffle files")
+
+//var numReduce = flag.Int("numReduce", 1, "Number of reduce funtions")
 
 // Main starts the Driver, running the submitted jobs.
 func (d *Driver) Main() {
@@ -230,17 +267,20 @@ func (d *Driver) Main() {
 
 	if *undeploy {
 		lambda := newLambdaExecutor(viper.GetString("lambdaFunctionName"))
+		start := time.Now()
 		lambda.Undeploy()
+		end := time.Now()
+		fmt.Printf("Undeply function %s time: %s\n", viper.GetString("lambdaFunctionName"), end.Sub(start))
 		return
 	}
 
-	d.config.Inputs = append(d.config.Inputs, flag.Args()...)
+	d.Config.Inputs = append(d.Config.Inputs, flag.Args()...)
 	if *lambdaFlag {
 		d.executor = newLambdaExecutor(viper.GetString("lambdaFunctionName"))
 	}
 
 	if *outputDir != "" {
-		d.config.WorkingLocation = *outputDir
+		d.Config.WorkingLocation = *outputDir
 	}
 
 	start := time.Now()

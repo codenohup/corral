@@ -35,10 +35,19 @@ func runningInLambda() bool {
 	return true
 }
 
-func prepareResult(job *Job) string {
+func prepareResult(job *Job, task task) string {
+	var bytesRead int
+	var bytesWritten int
+	if task.Phase == MapPhase {
+		bytesRead = int(job.mapBytesRead)
+		bytesWritten = int(job.mapBytesWritten)
+	} else {
+		bytesRead = int(job.reduceBytesRead)
+		bytesWritten = int(job.reduceBytesWritten)
+	}
 	result := taskResult{
-		BytesRead:    int(job.bytesRead),
-		BytesWritten: int(job.bytesWritten),
+		BytesRead:    bytesRead,
+		BytesWritten: bytesWritten,
 	}
 
 	payload, _ := json.Marshal(result)
@@ -58,15 +67,17 @@ func handleRequest(ctx context.Context, task task) (string, error) {
 	currentJob.config.Cleanup = task.Cleanup
 
 	// Need to reset job counters in case this is a reused lambda
-	currentJob.bytesRead = 0
-	currentJob.bytesWritten = 0
+	currentJob.mapBytesRead = 0
+	currentJob.mapBytesWritten = 0
+	currentJob.reduceBytesRead = 0
+	currentJob.reduceBytesWritten = 0
 
 	if task.Phase == MapPhase {
 		err := currentJob.runMapper(task.BinID, task.Splits)
-		return prepareResult(currentJob), err
+		return prepareResult(currentJob, task), err
 	} else if task.Phase == ReducePhase {
 		err := currentJob.runReducer(task.BinID)
-		return prepareResult(currentJob), err
+		return prepareResult(currentJob, task), err
 	}
 	return "", fmt.Errorf("Unknown phase: %d", task.Phase)
 }
@@ -115,8 +126,8 @@ func (l *lambdaExecutor) RunMapper(job *Job, jobNumber int, binID uint, inputSpl
 	resultPayload, err := l.Invoke(l.functionName, payload)
 	taskResult := loadTaskResult(resultPayload)
 
-	atomic.AddInt64(&job.bytesRead, int64(taskResult.BytesRead))
-	atomic.AddInt64(&job.bytesWritten, int64(taskResult.BytesWritten))
+	atomic.AddInt64(&job.mapBytesRead, int64(taskResult.BytesRead))
+	atomic.AddInt64(&job.mapBytesWritten, int64(taskResult.BytesWritten))
 
 	return err
 }
@@ -138,8 +149,8 @@ func (l *lambdaExecutor) RunReducer(job *Job, jobNumber int, binID uint) error {
 	resultPayload, err := l.Invoke(l.functionName, payload)
 	taskResult := loadTaskResult(resultPayload)
 
-	atomic.AddInt64(&job.bytesRead, int64(taskResult.BytesRead))
-	atomic.AddInt64(&job.bytesWritten, int64(taskResult.BytesWritten))
+	atomic.AddInt64(&job.reduceBytesRead, int64(taskResult.BytesRead))
+	atomic.AddInt64(&job.reduceBytesWritten, int64(taskResult.BytesWritten))
 
 	return err
 }

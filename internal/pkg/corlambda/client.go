@@ -137,7 +137,7 @@ func crossCompile(binName string) (string, error) {
 	}
 	cmd := exec.Command("go", args...)
 
-	cmd.Env = append(os.Environ(), "GOOS=linux")
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0")
 
 	combinedOut, err := cmd.CombinedOutput()
 	if err != nil {
