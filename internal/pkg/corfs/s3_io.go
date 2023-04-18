@@ -2,6 +2,7 @@ package corfs
 
 import (
 	"fmt"
+	log "github.com/sirupsen/logrus"
 	"io"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -28,6 +29,10 @@ func (s *s3Writer) Init() error {
 
 	if result != nil {
 		s.uploadID = *result.UploadId
+	}
+	if err != nil {
+		log.Infof("Error occur in s3 writer init CreateMultipartUpload, err msg: %v \n", err.Error())
+		fmt.Printf("Error occur in s3 writer init CreateMultipartUpload, err msg: %v \n", err.Error())
 	}
 	return err
 }

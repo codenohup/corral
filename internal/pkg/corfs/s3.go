@@ -31,6 +31,11 @@ type S3FileSystem struct {
 	objectCache *lru.Cache
 }
 
+func (s *S3FileSystem) MakeDir(filePath string) error {
+	// Skip
+	return nil
+}
+
 var _ FileSystem = &S3FileSystem{}
 
 func parseS3URI(uri string) (*url.URL, error) {

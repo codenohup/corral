@@ -270,7 +270,7 @@ func (l *LambdaClient) Invoke(functionName string, payload []byte) (outputPayloa
 		if err == nil {
 			break
 		}
-		log.Warnf("Function invocation failed. (Attempt %d of %d)", try+1, MaxLambdaRetries)
+		log.Warnf("Function invocation failed. (Attempt %d of %d), error msg: %v", try+1, MaxLambdaRetries, err.Error())
 	}
 	return outputPayload, err
 }

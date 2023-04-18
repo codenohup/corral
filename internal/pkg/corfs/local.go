@@ -11,6 +11,12 @@ import (
 // LocalFileSystem wraps "os" to provide access to the local filesystem.
 type LocalFileSystem struct{}
 
+func (l *LocalFileSystem) MakeDir(filePath string) error {
+	//TODO implement me
+	err := os.MkdirAll(filePath, os.ModePerm)
+	return err
+}
+
 func walkDir(dir string) []FileInfo {
 	files := make([]FileInfo, 0)
 	filepath.Walk(dir, func(path string, f os.FileInfo, err error) error {

@@ -8,6 +8,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
@@ -35,19 +36,29 @@ func runningInLambda() bool {
 	return true
 }
 
-func prepareResult(job *Job, task task) string {
+func runningLocal() bool {
+	return !runningInLambda()
+}
+
+func prepareResult(job *Job, task task, functionStartTime time.Time, lengths []int) string {
 	var bytesRead int
 	var bytesWritten int
 	if task.Phase == MapPhase {
 		bytesRead = int(job.mapBytesRead)
 		bytesWritten = int(job.mapBytesWritten)
-	} else {
+	} else if task.Phase == ReducePhase {
 		bytesRead = int(job.reduceBytesRead)
 		bytesWritten = int(job.reduceBytesWritten)
+	} else if task.Phase == MergePhase {
+		bytesRead = int(job.mergeBytesRead)
+		bytesWritten = int(job.mergeBytesWritten)
 	}
+
 	result := taskResult{
 		BytesRead:    bytesRead,
 		BytesWritten: bytesWritten,
+		RunningTime:  time.Now().Sub(functionStartTime).Milliseconds(),
+		Lengths:      nil, // lengths
 	}
 
 	payload, _ := json.Marshal(result)
@@ -56,6 +67,10 @@ func prepareResult(job *Job, task task) string {
 
 func handleRequest(ctx context.Context, task task) (string, error) {
 	// Precaution to avoid running out of memory for reused Lambdas
+	functionStartTime := time.Now()
+
+	fmt.Printf("[handleRequest] receive task %v, binID: %v, taskID: %v\n", task.Phase, task.BinID, task.TaskID)
+
 	debug.FreeOSMemory()
 
 	// Setup current job
@@ -71,13 +86,20 @@ func handleRequest(ctx context.Context, task task) (string, error) {
 	currentJob.mapBytesWritten = 0
 	currentJob.reduceBytesRead = 0
 	currentJob.reduceBytesWritten = 0
+	currentJob.mergeBytesRead = 0
+	currentJob.mergeBytesWritten = 0
+
+	currentJob.config.NumReduce = task.NumReduce
 
 	if task.Phase == MapPhase {
-		err := currentJob.runMapper(task.BinID, task.Splits)
-		return prepareResult(currentJob, task), err
+		lengths, err := currentJob.runMapper(task.BinID, task.Splits)
+		return prepareResult(currentJob, task, functionStartTime, lengths), err
 	} else if task.Phase == ReducePhase {
 		err := currentJob.runReducer(task.BinID)
-		return prepareResult(currentJob, task), err
+		return prepareResult(currentJob, task, functionStartTime, nil), err
+	} else if task.Phase == MergePhase {
+		err := currentJob.runMerger(task.TaskID, task.StartFileID, task.EndFileID)
+		return prepareResult(currentJob, task, functionStartTime, nil), err
 	}
 	return "", fmt.Errorf("Unknown phase: %d", task.Phase)
 }
@@ -86,6 +108,34 @@ type lambdaExecutor struct {
 	*corlambda.LambdaClient
 	*coriam.IAMClient
 	functionName string
+}
+
+func (l *lambdaExecutor) RunMerge(job *Job, jobNumber int, taskID int, startFileID int, endFileID int) error {
+	mergeTask := task{
+		JobNumber:       jobNumber,
+		Phase:           MergePhase,
+		FileSystemType:  corfs.S3,
+		WorkingLocation: job.outputPath,
+		TaskID:          taskID,
+		StartFileID:     startFileID,
+		EndFileID:       endFileID,
+		NumReduce:       job.config.NumReduce,
+	}
+	payload, err := json.Marshal(mergeTask)
+	if err != nil {
+		return err
+	}
+
+	resultPayload, err := l.Invoke(l.functionName, payload)
+	taskResult := loadTaskResult(resultPayload)
+
+	atomic.AddInt64(&job.mergeBytesRead, int64(taskResult.BytesRead))
+	atomic.AddInt64(&job.mergeBytesWritten, int64(taskResult.BytesWritten))
+	if taskResult.RunningTime > 0 {
+		atomic.AddInt64(&job.cloudFuncRunningTime, taskResult.RunningTime)
+	}
+
+	return err
 }
 
 func newLambdaExecutor(functionName string) *lambdaExecutor {
@@ -128,20 +178,33 @@ func (l *lambdaExecutor) RunMapper(job *Job, jobNumber int, binID uint, inputSpl
 
 	atomic.AddInt64(&job.mapBytesRead, int64(taskResult.BytesRead))
 	atomic.AddInt64(&job.mapBytesWritten, int64(taskResult.BytesWritten))
+	atomic.AddInt64(&job.cloudFuncRunningTime, taskResult.RunningTime)
+
+	//if shuffleEmitterType == "SingleFile" {
+	//	if taskResult.Lengths == nil || len(taskResult.Lengths) != job.config.NumReduce {
+	//		return errors.New("Error occur in write lengths to index file to local")
+	//	}
+	//	emitter := newSingleFileMapperEmitter(job.intermediateBins, binID, viper.GetString("localout"), &corfs.LocalFileSystem{})
+	//	err := emitter.writeToIndexFile(taskResult.Lengths)
+	//	if err != nil {
+	//		return err
+	//	}
+	//}
 
 	return err
 }
 
 func (l *lambdaExecutor) RunReducer(job *Job, jobNumber int, binID uint) error {
-	mapTask := task{
+	reduceTask := task{
 		JobNumber:       jobNumber,
 		Phase:           ReducePhase,
 		BinID:           binID,
 		FileSystemType:  corfs.S3,
 		WorkingLocation: job.outputPath,
 		Cleanup:         job.config.Cleanup,
+		NumReduce:       job.config.NumReduce,
 	}
-	payload, err := json.Marshal(mapTask)
+	payload, err := json.Marshal(reduceTask)
 	if err != nil {
 		return err
 	}
@@ -151,6 +214,7 @@ func (l *lambdaExecutor) RunReducer(job *Job, jobNumber int, binID uint) error {
 
 	atomic.AddInt64(&job.reduceBytesRead, int64(taskResult.BytesRead))
 	atomic.AddInt64(&job.reduceBytesWritten, int64(taskResult.BytesWritten))
+	atomic.AddInt64(&job.cloudFuncRunningTime, taskResult.RunningTime)
 
 	return err
 }

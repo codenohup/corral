@@ -74,6 +74,11 @@ type mockFs struct {
 	writers map[string]*testWriteCloser
 }
 
+func (m *mockFs) MakeDir(filePath string) error {
+	//TODO implement me
+	return nil
+}
+
 func (m *mockFs) ListFiles(string) ([]corfs.FileInfo, error) {
 	return []corfs.FileInfo{}, nil
 }

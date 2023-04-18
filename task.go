@@ -11,6 +11,7 @@ type Phase int
 const (
 	MapPhase Phase = iota
 	ReducePhase
+	MergePhase
 )
 
 // task defines a serialized description of a single unit of work
@@ -25,9 +26,16 @@ type task struct {
 	FileSystemType   corfs.FileSystemType
 	WorkingLocation  string
 	Cleanup          bool
+	NumMap           int
+	NumReduce        int
+	TaskID           int
+	StartFileID      int
+	EndFileID        int
 }
 
 type taskResult struct {
 	BytesRead    int
 	BytesWritten int
+	Lengths      []int
+	RunningTime  int64
 }

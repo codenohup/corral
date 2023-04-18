@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"sync"
 	"time"
 
@@ -21,10 +22,6 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/bcongdon/corral/internal/pkg/corfs"
 	flag "github.com/spf13/pflag"
-)
-
-const (
-	shuffleOutType = "line" // "line", Shuffle数据按行输出，key`\tab`val; "json": Shuffle数据按json格式输出
 )
 
 // Driver controls the execution of a MapReduce Job
@@ -44,6 +41,7 @@ type config struct {
 	WorkingLocation string
 	Cleanup         bool
 	NumReduce       int
+	NumMap          int
 }
 
 func newConfig() *config {
@@ -157,6 +155,7 @@ func (d *Driver) runMapPhase(job *Job, jobNumber int, inputs []string) {
 	log.Debugf("Number of job input splits: %d", len(inputSplits))
 
 	inputBins := packInputSplits(inputSplits, d.Config.MapBinSize)
+	d.Config.NumMap = len(inputBins)
 	log.Debugf("Number of job input bins: %d", len(inputBins))
 	bar := pb.New(len(inputBins)).Prefix("Map").Start()
 
@@ -179,13 +178,40 @@ func (d *Driver) runMapPhase(job *Job, jobNumber int, inputs []string) {
 	bar.Finish()
 }
 
+func (d *Driver) runMergePhase(job *Job, jobNumber int) {
+	numOfMergeTasks := (d.Config.NumMap + shuffleFileMergeDegree - 1) / shuffleFileMergeDegree
+	log.Debugf("Number of job merge tasks: %d", numOfMergeTasks)
+	bar := pb.New(numOfMergeTasks).Prefix("Merge").Start()
+
+	var wg sync.WaitGroup
+	sem := semaphore.NewWeighted(int64(d.Config.MaxConcurrency))
+	for taskId := 0; taskId < numOfMergeTasks; taskId++ {
+		sem.Acquire(context.Background(), 1)
+		wg.Add(1)
+		go func(taskId int, startFileID int, endFileID int) { // 合并[start,end]范围里的Shuffle文件
+			defer wg.Done()
+			defer sem.Release(1)
+			defer bar.Increment()
+			err := d.executor.RunMerge(job, jobNumber, taskId, startFileID, endFileID)
+			if err != nil {
+				log.Errorf("Error when running merge task, need to merged file range: [%d, %d], Error: %s", startFileID, endFileID, err.Error())
+			}
+		}(taskId, taskId*shuffleFileMergeDegree, int(min(int64((taskId+1)*shuffleFileMergeDegree-1), int64(d.Config.NumMap-1))))
+	}
+	wg.Wait()
+	bar.Finish()
+}
+
 func (d *Driver) runReducePhase(job *Job, jobNumber int) {
 	var wg sync.WaitGroup
 	bar := pb.New(int(job.intermediateBins)).Prefix("Reduce").Start()
+	sem := semaphore.NewWeighted(int64(d.Config.MaxConcurrency))
 	for binID := uint(0); binID < job.intermediateBins; binID++ {
+		sem.Acquire(context.Background(), 1)
 		wg.Add(1)
 		go func(bID uint) {
 			defer wg.Done()
+			defer sem.Release(1)
 			defer bar.Increment()
 			err := d.executor.RunReducer(job, jobNumber, bID)
 			if err != nil {
@@ -230,23 +256,42 @@ func (d *Driver) run() {
 
 		*job.config = *d.Config
 
+		job.fileSystem.MakeDir(job.fileSystem.Join(jobWorkingLoc, "Shuffle_origin"))
+		job.fileSystem.MakeDir(job.fileSystem.Join(jobWorkingLoc, "Shuffle_merge"))
+		job.fileSystem.MakeDir(job.fileSystem.Join(jobWorkingLoc, "Output"))
+
+		for partitionID := 0; partitionID < d.Config.NumReduce; partitionID++ {
+			job.fileSystem.MakeDir(job.fileSystem.Join(jobWorkingLoc, "Shuffle_merge", "Reduce_"+strconv.Itoa(partitionID)))
+		}
+
 		mapStart := time.Now()
 		d.runMapPhase(job, idx, inputs)
 		mapEnd := time.Now()
-		fmt.Printf("Job%d (%d/%d) Map State Execution Time: %s\n", idx, idx+1, len(d.jobs), mapEnd.Sub(mapStart))
+		fmt.Printf("Job%d (%d/%d) Map phase Execution Time: %s\n", idx, idx+1, len(d.jobs), mapEnd.Sub(mapStart))
+
+		if jobRunningType == "MapMergeReduce" {
+			mergeStart := time.Now()
+			d.runMergePhase(job, idx)
+			mergeEnd := time.Now()
+			fmt.Printf("Job%d (%d/%d) Merge phase Execution Time: %s\n", idx, idx+1, len(d.jobs), mergeEnd.Sub(mergeStart))
+		}
 
 		reduceStart := time.Now()
 		d.runReducePhase(job, idx)
 		reduceEnd := time.Now()
-		fmt.Printf("Job%d (%d/%d) Reduce State Execution Time: %s\n", idx, idx+1, len(d.jobs), reduceEnd.Sub(reduceStart))
+		fmt.Printf("Job%d (%d/%d) Reduce phase Execution Time: %s\n", idx, idx+1, len(d.jobs), reduceEnd.Sub(reduceStart))
 
 		// Set inputs of next job to be outputs of current job
 		inputs = []string{job.fileSystem.Join(jobWorkingLoc, "output-*")}
 
 		log.Infof("Job %d - Map Bytes Read:\t%s", idx, humanize.Bytes(uint64(job.mapBytesRead)))
 		log.Infof("Job %d - Map Bytes Written:\t%s", idx, humanize.Bytes(uint64(job.mapBytesWritten)))
+		log.Infof("Job %d - Merge Bytes Read:\t%s", idx, humanize.Bytes(uint64(job.mergeBytesRead)))
+		log.Infof("Job %d - Merge Bytes Written:\t%s", idx, humanize.Bytes(uint64(job.mergeBytesWritten)))
 		log.Infof("Job %d - Reduce Bytes Read:\t%s", idx, humanize.Bytes(uint64(job.reduceBytesRead)))
 		log.Infof("Job %d - Reduce Bytes Written:\t%s", idx, humanize.Bytes(uint64(job.reduceBytesWritten)))
+		duration := time.Duration(job.cloudFuncRunningTime) * time.Millisecond
+		log.Infof("Job %d - Cloud Functions Running Time:\t%v", idx, duration)
 	}
 }
 
@@ -256,6 +301,7 @@ var memprofile = flag.String("memprofile", "", "Write memory profile to `file`")
 var verbose = flag.BoolP("verbose", "v", false, "Output verbose logs")
 var undeploy = flag.Bool("undeploy", false, "Undeploy the Lambda function and IAM permissions without running the driver")
 var cleanup = flag.Bool("cleanup", true, "Whether delete shuffle files")
+var localOutputDir = flag.String("localout", "lo", "Shuffle write dir in local") // 只有在running on lambda，WriteCombine Shuffle时才有用
 
 //var numReduce = flag.Int("numReduce", 1, "Number of reduce funtions")
 
@@ -270,7 +316,7 @@ func (d *Driver) Main() {
 		start := time.Now()
 		lambda.Undeploy()
 		end := time.Now()
-		fmt.Printf("Undeply function %s time: %s\n", viper.GetString("lambdaFunctionName"), end.Sub(start))
+		fmt.Printf("Undeply function %s time: %v\n", viper.GetString("lambdaFunctionName"), end.Sub(start))
 		return
 	}
 

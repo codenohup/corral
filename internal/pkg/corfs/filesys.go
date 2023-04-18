@@ -26,6 +26,7 @@ type FileSystem interface {
 	Delete(filePath string) error
 	Join(elem ...string) string
 	Init() error
+	MakeDir(filePath string) error
 }
 
 // FileInfo provides information about a file
