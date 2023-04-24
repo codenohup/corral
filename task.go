@@ -12,6 +12,7 @@ const (
 	MapPhase Phase = iota
 	ReducePhase
 	MergePhase
+	CombinePhase
 )
 
 // task defines a serialized description of a single unit of work
@@ -31,6 +32,9 @@ type task struct {
 	TaskID           int
 	StartFileID      int
 	EndFileID        int
+
+	CombineOutputFilePath string
+	NeedToCombinedFiles   []string
 }
 
 type taskResult struct {

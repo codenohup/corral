@@ -3,6 +3,7 @@ package corral
 import (
 	"context"
 	"fmt"
+	"github.com/google/uuid"
 	"os"
 	"runtime"
 	"runtime/pprof"
@@ -164,6 +165,7 @@ func (d *Driver) runMapPhase(job *Job, jobNumber int, inputs []string) {
 	for binID, bin := range inputBins {
 		sem.Acquire(context.Background(), 1)
 		wg.Add(1)
+		job.cloudFuncNum++
 		go func(bID uint, b []inputSplit) {
 			defer wg.Done()
 			defer sem.Release(1)
@@ -172,10 +174,15 @@ func (d *Driver) runMapPhase(job *Job, jobNumber int, inputs []string) {
 			if err != nil {
 				log.Errorf("Error when running mapper %d: %s", bID, err)
 			}
+			if jobShuffleMode == LSMCombine {
+				shuffleFilePath := job.fileSystem.Join(job.outputPath, "Shuffle_origin", fmt.Sprintf("Shuffle_%d_Map_%d.data", defaultShuffleID, bID))
+				job.mapperCompletedChan <- shuffleFilePath
+			}
 		}(uint(binID), bin)
 	}
 	wg.Wait()
 	bar.Finish()
+	close(job.mapperCompletedChan)
 }
 
 func (d *Driver) runMergePhase(job *Job, jobNumber int) {
@@ -192,6 +199,7 @@ func (d *Driver) runMergePhase(job *Job, jobNumber int) {
 			defer wg.Done()
 			defer sem.Release(1)
 			defer bar.Increment()
+			job.cloudFuncNum++
 			err := d.executor.RunMerge(job, jobNumber, taskId, startFileID, endFileID)
 			if err != nil {
 				log.Errorf("Error when running merge task, need to merged file range: [%d, %d], Error: %s", startFileID, endFileID, err.Error())
@@ -213,6 +221,7 @@ func (d *Driver) runReducePhase(job *Job, jobNumber int) {
 			defer wg.Done()
 			defer sem.Release(1)
 			defer bar.Increment()
+			job.cloudFuncNum++
 			err := d.executor.RunReducer(job, jobNumber, bID)
 			if err != nil {
 				log.Errorf("Error when running reducer %d: %s", bID, err)
@@ -223,13 +232,179 @@ func (d *Driver) runReducePhase(job *Job, jobNumber int) {
 	bar.Finish()
 }
 
+func (d *Driver) runCombineTask(job *Job, jobNumber int, outputPath string, paths []string, mustExecute bool) (bool, error) {
+	if !mustExecute {
+		var files []corfs.FileInfo
+		for _, path := range paths {
+			stat, _ := job.fileSystem.Stat(path)
+			files = append(files, stat)
+		}
+
+		var accumulateSize int64 = 0
+		for _, f := range files {
+			accumulateSize += f.Size
+		}
+		// 如果文件累计大小达到了指定阈值，退出Combine过程，后面接着执行Reduce过程
+		if accumulateSize >= lsmCombineShuffleFileSizeSumThreshold {
+			return false, nil
+		}
+	}
+
+	job.cloudFuncNum++
+	err := d.executor.RunCombiner(job, jobNumber, outputPath, paths)
+	if err != nil {
+		log.Errorf("Error when running Combiner %v, files: %v, Error msg: %v\n", outputPath, paths, err)
+	}
+
+	return true, err
+}
+
+func (d *Driver) runCombinePhase(job *Job, jobNumber int) {
+	var wg sync.WaitGroup
+	sem := semaphore.NewWeighted(int64(d.Config.MaxConcurrency))
+
+	// 计算可能有多少个MergeTask（不准，没关系）
+	numOfCombineStages := 0
+	numOfCombineTasks := 0
+	for t := d.Config.NumMap; t > 1; t = t / lsmCombineDegree {
+		numOfCombineStages++
+		numOfCombineTasks += (t + lsmCombineDegree - 1) / lsmCombineDegree
+	}
+	bar := pb.New(numOfCombineTasks).Prefix("Combine").Start()
+
+	// 不断读取Mapper/Combiner完成的输出文件，如果文件大小超出阈值，则不进行Combine
+	mapperChannelExigFlag := false
+	combineOutputChannel := make(chan string, corfs.MaxInt(d.Config.NumMap, 500))
+
+	var needToCombinedFiles []string
+	for {
+		select {
+		case path := <-combineOutputChannel:
+			needToCombinedFiles = append(needToCombinedFiles, path)
+		case path, ok := <-job.mapperCompletedChan:
+			if !ok {
+				mapperChannelExigFlag = true
+			} else {
+				needToCombinedFiles = append(needToCombinedFiles, path)
+			}
+		}
+
+		if !mapperChannelExigFlag && len(needToCombinedFiles) >= lsmCombineDegree {
+			//fmt.Printf("Combine %v in once \n", len(needToCombinedFiles))
+			sem.Acquire(context.Background(), 1)
+			files := make([]string, len(needToCombinedFiles))
+			copy(files, needToCombinedFiles)
+			wg.Add(1)
+			go func(files []string) {
+				defer wg.Done()
+				defer sem.Release(1)
+				defer bar.Increment()
+				outputPath := job.fileSystem.Join(job.outputPath, "Shuffle_origin", fmt.Sprintf("combine_%s.data", uuid.NewString()))
+				success, _ := d.runCombineTask(job, jobNumber, outputPath, files, false)
+				if success {
+					combineOutputChannel <- outputPath
+				}
+			}(files)
+
+			needToCombinedFiles = []string{}
+		}
+
+		if mapperChannelExigFlag {
+			break
+		}
+	}
+
+	//close(combineOutputChannel)
+	wg.Wait()
+	bar.Finish()
+
+	//for combineStageID := 1; combineStageID <= numOfCombineStages; combineStageID++ {
+	//	// 读取上一轮的Shuffle文件，判断是否应该进行下一波Combine
+	//	// 如果不就行Combine，则退出，
+	//	// 后面接着做Reduce
+	//	if !nextLoopShouldBeContinue {
+	//		return
+	//	}
+	//
+	//	mergeTaskIdInLoop := 0
+	//
+	//	var path string
+	//	if combineStageID == 1 {
+	//		//path = job.fileSystem.Join(job.outputPath, "Shuffle_origin", fmt.Sprintf("Shuffle_%d_Map_*.data", defaultShuffleID))
+	//		channelExigFlag := false
+	//		var needToCombinedFiles []string
+	//		for {
+	//			select {
+	//			case path, ok := <-job.mapperCompletedChan:
+	//				if !ok {
+	//					channelExigFlag = true
+	//				} else {
+	//					needToCombinedFiles = append(needToCombinedFiles, path)
+	//				}
+	//				if (len(needToCombinedFiles) >= lsmCombineDegree) || (len(needToCombinedFiles) > 1 && channelExigFlag) {
+	//					sem.Acquire(context.Background(), 1)
+	//					wg.Add(1)
+	//					go func() {
+	//						defer wg.Done()
+	//						defer sem.Release(1)
+	//						defer bar.Increment()
+	//						nextLoopFlag, _ := d.runCombineTask(job, jobNumber, combineStageID, mergeTaskIdInLoop, needToCombinedFiles)
+	//						if !nextLoopFlag {
+	//							nextLoopShouldBeContinue = true
+	//						}
+	//					}()
+	//				}
+	//			default:
+	//				time.Sleep(10 * time.Millisecond)
+	//			}
+	//
+	//			if channelExigFlag {
+	//				break
+	//			}
+	//		}
+	//	} else {
+	//		path = job.fileSystem.Join(job.outputPath, "Shuffle_combine", "combine_*.data")
+	//	}
+	//files, _ := job.fileSystem.ListFiles(path)
+	//var accumulateSize int64 = 0
+	//for _, f := range files {
+	//	accumulateSize += f.Size
+	//}
+	//avgSizePerShuffleFile := float64(accumulateSize) / float64(len(files)) // 如果文件平均大小达到了指定阈值，退出Combine过程，后面接着执行Reduce过程
+	//if avgSizePerShuffleFile >= lsmCombineShuffleFileSizeThreshold {
+	//	return
+	//}
+	//
+	//fileSegments := corfs.ArraySplitByFixedInterval(files, lsmCombineDegree)
+	//
+	//for mergeTaskIdInLoop, segment := range fileSegments {
+	//	mergeTaskID := fmt.Sprintf("%v_%v", combineStageID, mergeTaskIdInLoop)
+	//	sem.Acquire(context.Background(), 1)
+	//	wg.Add(1)
+	//	go func(mergeTaskID string, files []corfs.FileInfo) {
+	//		defer wg.Done()
+	//		defer sem.Release(1)
+	//		defer bar.Increment()
+	//		err := d.executor.RunCombiner(job, jobNumber, mergeTaskID, files)
+	//		if err != nil {
+	//			log.Errorf("Error when running Combiner %v, files: %v, Error msg: %v\n", mergeTaskID, files, err)
+	//		}
+	//	}(mergeTaskID, segment)
+	//
+	//	//d.executor.RunCombiner(job, jobNumber, mergeTaskID, segment)
+	//}
+	//wg.Wait()
+	//}
+
+}
+
 // run starts the Driver
 func (d *Driver) run() {
 	if runningInLambda() {
 		lambdaDriver = d
 		lambda.Start(handleRequest)
 	}
-	if lBackend, ok := d.executor.(*lambdaExecutor); ok {
+	if lBackend, ok := d.executor.(*LambdaExecutor); ok {
 		start := time.Now()
 		lBackend.Deploy()
 		end := time.Now()
@@ -257,11 +432,30 @@ func (d *Driver) run() {
 		*job.config = *d.Config
 
 		job.fileSystem.MakeDir(job.fileSystem.Join(jobWorkingLoc, "Shuffle_origin"))
-		job.fileSystem.MakeDir(job.fileSystem.Join(jobWorkingLoc, "Shuffle_merge"))
+		if jobShuffleMode == Merge || jobShuffleMode == MergeAndDivide {
+			job.fileSystem.MakeDir(job.fileSystem.Join(jobWorkingLoc, "Shuffle_merge"))
+			job.fileSystem.MakeDir(job.fileSystem.Join(jobWorkingLoc, "Shuffle_merge", "Merge"))
+		}
+		if jobShuffleMode == LSMCombine {
+			job.fileSystem.MakeDir(job.fileSystem.Join(jobWorkingLoc, "Shuffle_combine"))
+		}
 		job.fileSystem.MakeDir(job.fileSystem.Join(jobWorkingLoc, "Output"))
 
 		for partitionID := 0; partitionID < d.Config.NumReduce; partitionID++ {
 			job.fileSystem.MakeDir(job.fileSystem.Join(jobWorkingLoc, "Shuffle_merge", "Reduce_"+strconv.Itoa(partitionID)))
+		}
+
+		combinePhaseExitFlag := false
+		if jobShuffleMode == LSMCombine {
+			// 如果是LSMShuffle，则启动Combine阶段
+			//combineOutputChannel := make(chan string)
+			go func(job *Job, idx int) {
+				combineStart := time.Now()
+				d.runCombinePhase(job, idx)
+				combineEnd := time.Now()
+				fmt.Printf("Job%d (%d/%d) Combine phase Execution Time: %s\n", idx, idx+1, len(d.jobs), combineEnd.Sub(combineStart))
+				combinePhaseExitFlag = true
+			}(job, idx)
 		}
 
 		mapStart := time.Now()
@@ -269,13 +463,19 @@ func (d *Driver) run() {
 		mapEnd := time.Now()
 		fmt.Printf("Job%d (%d/%d) Map phase Execution Time: %s\n", idx, idx+1, len(d.jobs), mapEnd.Sub(mapStart))
 
-		if jobRunningType == "MapMergeReduce" {
+		if jobShuffleMode == Merge || jobShuffleMode == MergeAndDivide {
 			mergeStart := time.Now()
 			d.runMergePhase(job, idx)
 			mergeEnd := time.Now()
 			fmt.Printf("Job%d (%d/%d) Merge phase Execution Time: %s\n", idx, idx+1, len(d.jobs), mergeEnd.Sub(mergeStart))
 		}
 
+		// 如果Combine阶段还没结束，需要等待
+		for jobShuffleMode == LSMCombine && !combinePhaseExitFlag {
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		// 启动Reduce 阶段
 		reduceStart := time.Now()
 		d.runReducePhase(job, idx)
 		reduceEnd := time.Now()
@@ -286,12 +486,20 @@ func (d *Driver) run() {
 
 		log.Infof("Job %d - Map Bytes Read:\t%s", idx, humanize.Bytes(uint64(job.mapBytesRead)))
 		log.Infof("Job %d - Map Bytes Written:\t%s", idx, humanize.Bytes(uint64(job.mapBytesWritten)))
-		log.Infof("Job %d - Merge Bytes Read:\t%s", idx, humanize.Bytes(uint64(job.mergeBytesRead)))
-		log.Infof("Job %d - Merge Bytes Written:\t%s", idx, humanize.Bytes(uint64(job.mergeBytesWritten)))
+		if jobShuffleMode == Merge || jobShuffleMode == MergeAndDivide {
+			log.Infof("Job %d - Merge Bytes Read:\t%s", idx, humanize.Bytes(uint64(job.mergeBytesRead)))
+			log.Infof("Job %d - Merge Bytes Written:\t%s", idx, humanize.Bytes(uint64(job.mergeBytesWritten)))
+		}
+		if jobShuffleMode == LSMCombine {
+			log.Infof("Job %d - Combine Bytes Read:\t%s", idx, humanize.Bytes(uint64(job.combineBytesRead)))
+			log.Infof("Job %d - Combine Bytes Written:\t%s", idx, humanize.Bytes(uint64(job.combineBytesWritten)))
+		}
 		log.Infof("Job %d - Reduce Bytes Read:\t%s", idx, humanize.Bytes(uint64(job.reduceBytesRead)))
 		log.Infof("Job %d - Reduce Bytes Written:\t%s", idx, humanize.Bytes(uint64(job.reduceBytesWritten)))
+
 		duration := time.Duration(job.cloudFuncRunningTime) * time.Millisecond
 		log.Infof("Job %d - Cloud Functions Running Time:\t%v", idx, duration)
+		log.Infof("Job %d - Cloud/Local Functions Number:\t%v", idx, job.cloudFuncNum)
 	}
 }
 
@@ -312,7 +520,7 @@ func (d *Driver) Main() {
 	}
 
 	if *undeploy {
-		lambda := newLambdaExecutor(viper.GetString("lambdaFunctionName"))
+		lambda := NewLambdaExecutor(viper.GetString("lambdaFunctionName"))
 		start := time.Now()
 		lambda.Undeploy()
 		end := time.Now()
@@ -322,7 +530,7 @@ func (d *Driver) Main() {
 
 	d.Config.Inputs = append(d.Config.Inputs, flag.Args()...)
 	if *lambdaFlag {
-		d.executor = newLambdaExecutor(viper.GetString("lambdaFunctionName"))
+		d.executor = NewLambdaExecutor(viper.GetString("lambdaFunctionName"))
 	}
 
 	if *outputDir != "" {

@@ -80,7 +80,7 @@ func (*mockLambdaClient) CreateFunction(*lambda.CreateFunctionInput) (*lambda.Fu
 
 func TestRunLambdaMapper(t *testing.T) {
 	mock := &mockLambdaClient{}
-	executor := &lambdaExecutor{
+	executor := &LambdaExecutor{
 		&corlambda.LambdaClient{
 			Client: mock,
 		},
@@ -104,7 +104,7 @@ func TestRunLambdaMapper(t *testing.T) {
 
 func TestRunLambdaReducer(t *testing.T) {
 	mock := &mockLambdaClient{}
-	executor := &lambdaExecutor{
+	executor := &LambdaExecutor{
 		&corlambda.LambdaClient{
 			Client: mock,
 		},
@@ -128,7 +128,7 @@ func TestRunLambdaReducer(t *testing.T) {
 
 func TestDeployFunction(t *testing.T) {
 	mock := &mockLambdaClient{}
-	executor := &lambdaExecutor{
+	executor := &LambdaExecutor{
 		&corlambda.LambdaClient{
 			Client: mock,
 		},

@@ -36,10 +36,6 @@ func runningInLambda() bool {
 	return true
 }
 
-func runningLocal() bool {
-	return !runningInLambda()
-}
-
 func prepareResult(job *Job, task task, functionStartTime time.Time, lengths []int) string {
 	var bytesRead int
 	var bytesWritten int
@@ -52,6 +48,9 @@ func prepareResult(job *Job, task task, functionStartTime time.Time, lengths []i
 	} else if task.Phase == MergePhase {
 		bytesRead = int(job.mergeBytesRead)
 		bytesWritten = int(job.mergeBytesWritten)
+	} else if task.Phase == CombinePhase {
+		bytesRead = int(job.combineBytesRead)
+		bytesWritten = int(job.combineBytesWritten)
 	}
 
 	result := taskResult{
@@ -88,6 +87,8 @@ func handleRequest(ctx context.Context, task task) (string, error) {
 	currentJob.reduceBytesWritten = 0
 	currentJob.mergeBytesRead = 0
 	currentJob.mergeBytesWritten = 0
+	currentJob.combineBytesRead = 0
+	currentJob.combineBytesWritten = 0
 
 	currentJob.config.NumReduce = task.NumReduce
 
@@ -100,17 +101,20 @@ func handleRequest(ctx context.Context, task task) (string, error) {
 	} else if task.Phase == MergePhase {
 		err := currentJob.runMerger(task.TaskID, task.StartFileID, task.EndFileID)
 		return prepareResult(currentJob, task, functionStartTime, nil), err
+	} else if task.Phase == CombinePhase {
+		err := currentJob.runCombiner(task.CombineOutputFilePath, task.NeedToCombinedFiles)
+		return prepareResult(currentJob, task, functionStartTime, nil), err
 	}
 	return "", fmt.Errorf("Unknown phase: %d", task.Phase)
 }
 
-type lambdaExecutor struct {
+type LambdaExecutor struct {
 	*corlambda.LambdaClient
 	*coriam.IAMClient
-	functionName string
+	FunctionName string
 }
 
-func (l *lambdaExecutor) RunMerge(job *Job, jobNumber int, taskID int, startFileID int, endFileID int) error {
+func (l *LambdaExecutor) RunMerge(job *Job, jobNumber int, taskID int, startFileID int, endFileID int) error {
 	mergeTask := task{
 		JobNumber:       jobNumber,
 		Phase:           MergePhase,
@@ -126,7 +130,7 @@ func (l *lambdaExecutor) RunMerge(job *Job, jobNumber int, taskID int, startFile
 		return err
 	}
 
-	resultPayload, err := l.Invoke(l.functionName, payload)
+	resultPayload, err := l.Invoke(l.FunctionName, payload)
 	taskResult := loadTaskResult(resultPayload)
 
 	atomic.AddInt64(&job.mergeBytesRead, int64(taskResult.BytesRead))
@@ -138,11 +142,11 @@ func (l *lambdaExecutor) RunMerge(job *Job, jobNumber int, taskID int, startFile
 	return err
 }
 
-func newLambdaExecutor(functionName string) *lambdaExecutor {
-	return &lambdaExecutor{
+func NewLambdaExecutor(functionName string) *LambdaExecutor {
+	return &LambdaExecutor{
 		LambdaClient: corlambda.NewLambdaClient(),
 		IAMClient:    coriam.NewIAMClient(),
-		functionName: functionName,
+		FunctionName: functionName,
 	}
 }
 
@@ -158,7 +162,7 @@ func loadTaskResult(payload []byte) taskResult {
 	return result
 }
 
-func (l *lambdaExecutor) RunMapper(job *Job, jobNumber int, binID uint, inputSplits []inputSplit) error {
+func (l *LambdaExecutor) RunMapper(job *Job, jobNumber int, binID uint, inputSplits []inputSplit) error {
 	mapTask := task{
 		JobNumber:        jobNumber,
 		Phase:            MapPhase,
@@ -173,7 +177,7 @@ func (l *lambdaExecutor) RunMapper(job *Job, jobNumber int, binID uint, inputSpl
 		return err
 	}
 
-	resultPayload, err := l.Invoke(l.functionName, payload)
+	resultPayload, err := l.Invoke(l.FunctionName, payload)
 	taskResult := loadTaskResult(resultPayload)
 
 	atomic.AddInt64(&job.mapBytesRead, int64(taskResult.BytesRead))
@@ -194,7 +198,7 @@ func (l *lambdaExecutor) RunMapper(job *Job, jobNumber int, binID uint, inputSpl
 	return err
 }
 
-func (l *lambdaExecutor) RunReducer(job *Job, jobNumber int, binID uint) error {
+func (l *LambdaExecutor) RunReducer(job *Job, jobNumber int, binID uint) error {
 	reduceTask := task{
 		JobNumber:       jobNumber,
 		Phase:           ReducePhase,
@@ -209,7 +213,7 @@ func (l *lambdaExecutor) RunReducer(job *Job, jobNumber int, binID uint) error {
 		return err
 	}
 
-	resultPayload, err := l.Invoke(l.functionName, payload)
+	resultPayload, err := l.Invoke(l.FunctionName, payload)
 	taskResult := loadTaskResult(resultPayload)
 
 	atomic.AddInt64(&job.reduceBytesRead, int64(taskResult.BytesRead))
@@ -219,7 +223,33 @@ func (l *lambdaExecutor) RunReducer(job *Job, jobNumber int, binID uint) error {
 	return err
 }
 
-func (l *lambdaExecutor) Deploy() {
+func (l *LambdaExecutor) RunCombiner(job *Job, jobNumber int, outputPath string, files []string) error {
+	reduceTask := task{
+		JobNumber:             jobNumber,
+		Phase:                 CombinePhase,
+		FileSystemType:        corfs.S3,
+		WorkingLocation:       job.outputPath,
+		Cleanup:               job.config.Cleanup,
+		NumReduce:             job.config.NumReduce,
+		CombineOutputFilePath: outputPath,
+		NeedToCombinedFiles:   files,
+	}
+	payload, err := json.Marshal(reduceTask)
+	if err != nil {
+		return err
+	}
+
+	resultPayload, err := l.Invoke(l.FunctionName, payload)
+	taskResult := loadTaskResult(resultPayload)
+
+	atomic.AddInt64(&job.combineBytesRead, int64(taskResult.BytesRead))
+	atomic.AddInt64(&job.combineBytesWritten, int64(taskResult.BytesWritten))
+	atomic.AddInt64(&job.cloudFuncRunningTime, taskResult.RunningTime)
+
+	return err
+}
+
+func (l *LambdaExecutor) Deploy() {
 	var roleARN string
 	var err error
 	if viper.GetBool("lambdaManageRole") {
@@ -232,7 +262,7 @@ func (l *lambdaExecutor) Deploy() {
 	}
 
 	config := &corlambda.FunctionConfig{
-		Name:       l.functionName,
+		Name:       l.FunctionName,
 		RoleARN:    roleARN,
 		Timeout:    viper.GetInt64("lambdaTimeout"),
 		MemorySize: viper.GetInt64("lambdaMemory"),
@@ -243,9 +273,9 @@ func (l *lambdaExecutor) Deploy() {
 	}
 }
 
-func (l *lambdaExecutor) Undeploy() {
+func (l *LambdaExecutor) Undeploy() {
 	log.Info("Undeploying function")
-	err := l.LambdaClient.DeleteFunction(l.functionName)
+	err := l.LambdaClient.DeleteFunction(l.FunctionName)
 	if err != nil {
 		log.Errorf("Error when undeploying function: %s", err)
 	}

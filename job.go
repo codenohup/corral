@@ -4,8 +4,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/google/uuid"
 	"io"
 	pathlib "path"
 	"regexp"
@@ -31,20 +31,25 @@ type Job struct {
 	intermediateBins uint
 	outputPath       string
 
-	mapBytesRead       int64
-	mapBytesWritten    int64
-	mergeBytesRead     int64
-	mergeBytesWritten  int64
-	reduceBytesRead    int64
-	reduceBytesWritten int64
+	mapBytesRead        int64
+	mapBytesWritten     int64
+	mergeBytesRead      int64
+	mergeBytesWritten   int64
+	reduceBytesRead     int64
+	reduceBytesWritten  int64
+	combineBytesRead    int64
+	combineBytesWritten int64
 
 	cloudFuncRunningTime int64
+	cloudFuncNum         int
+
+	mapperCompletedChan chan string
 }
 
 // Logic for running a single map task
 func (j *Job) runMapper(mapperID uint, splits []inputSplit) ([]int, error) {
 	var emitter Emitter
-	if shuffleEmitterType == "SingleFile" {
+	if jobShuffleMode == WriteCombine || jobShuffleMode == Merge || jobShuffleMode == MergeAndDivide || jobShuffleMode == LSMCombine {
 		singleFileMapperEmitter := newSingleFileMapperEmitter(j.intermediateBins, mapperID, j.outputPath, j.fileSystem)
 		emitter = &singleFileMapperEmitter
 	} else {
@@ -124,15 +129,20 @@ func (j *Job) runMapperSplit(split inputSplit, emitter Emitter) error {
 func (j *Job) runReducer(binID uint) error {
 	// Determine the intermediate data files this reducer is responsible for
 	var path string
-	if jobRunningType == "MapMergeReduce" {
-		// MapMergeReduce, 一个Map生成一个文件
+	if jobShuffleMode == MergeAndDivide {
 		path = j.fileSystem.Join(j.outputPath, "Shuffle_merge", "Reduce_"+strconv.Itoa(int(binID)), "*.data")
-	} else if shuffleEmitterType == "General" {
+	} else if jobShuffleMode == Merge {
+		path = j.fileSystem.Join(j.outputPath, "Shuffle_merge", "Merge", "*.data")
+	} else if jobShuffleMode == General {
 		// 一个Map生成R个文件时
 		path = j.fileSystem.Join(j.outputPath, "Shuffle_origin", fmt.Sprintf("Shuffle_%d_map_*_reduce_%d.data", defaultShuffleID, binID))
-	} else {
+	} else if jobShuffleMode == WriteCombine {
 		// 一个Map生成一个文件时
 		path = j.fileSystem.Join(j.outputPath, "Shuffle_origin", fmt.Sprintf("Shuffle_%d_Map_*.data", defaultShuffleID))
+	} else if jobShuffleMode == LSMCombine {
+		path = j.fileSystem.Join(j.outputPath, "Shuffle_origin", "*.data")
+	} else {
+		return errors.New("Unsupport Shuffle Mode\n")
 	}
 	files, err := j.fileSystem.ListFiles(path)
 	if err != nil {
@@ -154,9 +164,17 @@ func (j *Job) runReducer(binID uint) error {
 	for _, file := range files {
 		var startOffset = int64(0)
 		var endOffset = file.Size
-		if jobRunningType == "MapReduce" && shuffleEmitterType == "SingleFile" {
+		if jobShuffleMode == WriteCombine {
 			mapID, _ := strconv.Atoi(re.FindAllString(pathlib.Base(file.Name), -1)[1])
-			startOffset, endOffset, err = j.readOffsetByMapIDAndPartitionID(defaultShuffleID, mapID, binID)
+			indexPath := j.fileSystem.Join(j.outputPath, "Shuffle_origin", fmt.Sprintf("Shuffle_%d_Map_%d.index", defaultShuffleID, mapID))
+			startOffset, endOffset, err = j.readOffsetByPartitionID(indexPath, binID)
+			if err != nil {
+				return err
+			}
+		} else if jobShuffleMode == Merge || jobShuffleMode == LSMCombine {
+			// 通过拼接字符串，把/xxx.data生成/xxx.index文件路径
+			indexPath := file.Name[0:len(file.Name)-5] + ".index"
+			startOffset, endOffset, err = j.readOffsetByPartitionID(indexPath, binID)
 			if err != nil {
 				return err
 			}
@@ -249,8 +267,166 @@ func (j *Job) runReducer(binID uint) error {
 	return nil
 }
 
-func (j *Job) readOffsetByMapIDAndPartitionID(shuffleID int, mapID int, partitionID uint) (int64, int64, error) {
-	indexPath := j.fileSystem.Join(j.outputPath, "Shuffle_origin", fmt.Sprintf("Shuffle_%d_Map_%d.index", shuffleID, mapID))
+// Logic for running a single combine task
+// 读取n个Shuffle文件，合并为一个
+func (j *Job) runCombiner(outputPath string, files []string) error {
+	// 传进来的都是.data文件
+
+	// 打开输入文件的readers
+	indexReaders := make(map[int]*bufio.Reader)
+	inputDataReaders := make(map[int]*bufio.Reader)
+	perFileOffset := make(map[int]int) // 每个Shuffle文件读到哪里了（读取index文件得来的数据）
+
+	// 初始化各种原Shuffle文件的Reader
+	for fileID, file := range files {
+		indexPath := file[0:len(file)-5] + ".index"
+		indexR, err := j.fileSystem.OpenReader(indexPath, 0)
+		if err != nil {
+			log.Errorf("Error occur in Merge phase when open reader of %v\n", indexPath)
+		}
+		indexReaders[fileID] = bufio.NewReader(indexR)
+
+		dataR, err := j.fileSystem.OpenReader(file, 0)
+		if err != nil {
+			log.Errorf("Error occur in Merge phase when open reader of %v\n", file)
+		}
+		inputDataReaders[fileID] = bufio.NewReader(dataR)
+
+		offset, _, _ := indexReaders[fileID].ReadLine()
+		perFileOffset[fileID], _ = strconv.Atoi(string(offset))
+	}
+
+	// Open emitter for output data
+	//outputPath := j.fileSystem.Join(j.outputPath, "Shuffle_combine", fmt.Sprintf("combine_%v.data", outFileName))
+	emitWriter, err := j.fileSystem.OpenWriter(outputPath)
+	emitter := newReducerEmitter(emitWriter)
+	defer emitWriter.Close()
+	if err != nil {
+		return err
+	}
+
+	var bytesRead int64 = 0
+	var bytesWritten int64 = 0
+	var lengths []int
+
+	var waitGroup sync.WaitGroup
+	for partitionID := 0; partitionID < j.config.NumReduce; partitionID++ {
+		data := make(map[string][]string, 0)
+		for fileID, _ := range files {
+			var startOffset int64 = int64(perFileOffset[fileID])
+			endOffsetString, _, _ := indexReaders[fileID].ReadLine()
+			endOffsetInt, _ := strconv.Atoi(string(endOffsetString))
+			endOffset := int64(endOffsetInt)
+			bytesRead += endOffset - startOffset
+
+			if shuffleOutType == "json" {
+				//json格式序列化
+				//Feed intermediate data into reducers
+				decoder := json.NewDecoder(inputDataReaders[fileID])
+				for decoder.More() && decoder.InputOffset() <= endOffset {
+					var kv keyValue
+					if err := decoder.Decode(&kv); err != nil {
+						return err
+					}
+
+					if _, ok := data[kv.Key]; !ok {
+						data[kv.Key] = make([]string, 0)
+					}
+
+					data[kv.Key] = append(data[kv.Key], kv.Value)
+				}
+			} else {
+				// 按行读取
+				var currentOffset = startOffset
+				lineReader := bufio.NewReader(inputDataReaders[fileID])
+
+				for currentOffset < endOffset {
+					line, _, err := lineReader.ReadLine()
+					if err == io.EOF {
+						break
+					}
+					currentOffset += int64(len(line)) + 1 // 1是换行符的大小，读出来会自动略去换行符
+					kv := strings.Split(string(line), "\t")
+					if _, ok := data[kv[0]]; !ok {
+						data[kv[0]] = make([]string, 0)
+					}
+
+					data[kv[0]] = append(data[kv[0]], kv[1])
+				}
+			}
+			perFileOffset[fileID] = endOffsetInt
+		}
+
+		waitGroup.Wait()
+		lengths = append(lengths, int(emitter.bytesWritten()))
+
+		sem := semaphore.NewWeighted(10)
+		for key, values := range data {
+			sem.Acquire(context.Background(), 1)
+			waitGroup.Add(1)
+			go func(key string, values []string) {
+				defer sem.Release(1)
+
+				keyChan := make(chan string)
+				keyIter := newValueIterator(keyChan)
+
+				go func() {
+					defer waitGroup.Done()
+					j.Reduce.Reduce(key, keyIter, emitter)
+				}()
+
+				for _, value := range values {
+					// Pass current value to the appropriate key channel
+					keyChan <- value
+				}
+				close(keyChan)
+			}(key, values)
+		}
+	}
+
+	waitGroup.Wait()
+	lengths = append(lengths, int(emitter.bytesWritten()))
+
+	emitter.close()
+	emitWriter.Close()
+
+	// 写出index文件
+	indexPath := outputPath[0:len(outputPath)-5] + ".index"
+	indexWriter, err := j.fileSystem.OpenWriter(indexPath)
+	if err != nil {
+		return err
+	}
+	for _, offset := range lengths {
+		indexWriter.Write([]byte(fmt.Sprintf("%s\n", strconv.Itoa(offset))))
+	}
+	err = indexWriter.Close()
+	if err != nil {
+		return err
+	}
+
+	// Delete intermediate map data
+	if clearLsmCombineIntermediateFiles {
+		for _, file := range files {
+			err := j.fileSystem.Delete(file)
+			if err != nil {
+				log.Error(err)
+			}
+			indexPath := file[0:len(file)-5] + ".index"
+			err = j.fileSystem.Delete(indexPath)
+			if err != nil {
+				log.Error(err)
+			}
+		}
+	}
+
+	bytesWritten += emitter.bytesWritten()
+	atomic.AddInt64(&j.combineBytesWritten, emitter.bytesWritten())
+	atomic.AddInt64(&j.combineBytesRead, bytesRead)
+
+	return nil
+}
+
+func (j *Job) readOffsetByPartitionID(indexPath string, partitionID uint) (int64, int64, error) {
 	indexR, err := j.fileSystem.OpenReader(indexPath, 0)
 	if err != nil {
 		fmt.Printf(err.Error())
@@ -295,9 +471,11 @@ func (j *Job) runMerger(taskID int, startFileID int, endFileID int) error {
 
 	indexReaders := make(map[int]*bufio.Reader)
 	dataReaders := make(map[int]*bufio.Reader)
-	writers := make(map[int]io.WriteCloser)
-	perFileOffset := make(map[int]int) // 每个Shuffle文件读到哪里了（读取index文件得来的数据）
+	writers := make(map[int]io.WriteCloser)  // ShuffleMode==MergeAndDivide时，需要有R个writer
+	var dataWriterOnMergeMode io.WriteCloser // ShuffleMode==Merge时，只输出一个Shuffle文件，只需要一个writer
+	perFileOffset := make(map[int]int)       // 每个Shuffle文件读到哪里了（读取index文件得来的数据）
 
+	// 初始化各种原Shuffle文件的Reader
 	for fileID := startFileID; fileID <= endFileID; fileID++ {
 		indexPath := j.fileSystem.Join(j.outputPath, "Shuffle_origin", fmt.Sprintf("Shuffle_%d_Map_%d.index", defaultShuffleID, fileID))
 		indexR, err := j.fileSystem.OpenReader(indexPath, 0)
@@ -317,12 +495,21 @@ func (j *Job) runMerger(taskID int, startFileID int, endFileID int) error {
 		perFileOffset[fileID], _ = strconv.Atoi(string(offset))
 	}
 
-	for partitionID := 0; partitionID < j.config.NumReduce; partitionID++ {
-		outPath := j.fileSystem.Join(j.outputPath, "Shuffle_merge", "Reduce_"+strconv.Itoa(partitionID), uuid.NewString()+".data")
-		writers[partitionID], _ = j.fileSystem.OpenWriter(outPath)
+	// 初始化Writer指针
+	if jobShuffleMode == MergeAndDivide {
+		for partitionID := 0; partitionID < j.config.NumReduce; partitionID++ {
+			outPath := j.fileSystem.Join(j.outputPath, "Shuffle_merge", "Reduce_"+strconv.Itoa(partitionID), fmt.Sprintf("%v-%v.data", startFileID, endFileID))
+			writers[partitionID], _ = j.fileSystem.OpenWriter(outPath)
+		}
+	} else if jobShuffleMode == Merge {
+		outPath := j.fileSystem.Join(j.outputPath, "Shuffle_merge", "Merge", fmt.Sprintf("%v-%v.data", startFileID, endFileID))
+		dataWriterOnMergeMode, _ = j.fileSystem.OpenWriter(outPath)
 	}
 
 	var waitGroup sync.WaitGroup
+	lengths := make([]int, 0)
+	currentOffset := 0
+	lengths = append(lengths, currentOffset)
 	for partitionID := 0; partitionID < j.config.NumReduce; partitionID++ {
 		var datas []byte
 		for fileID := startFileID; fileID <= endFileID; fileID++ {
@@ -341,16 +528,42 @@ func (j *Job) runMerger(taskID int, startFileID int, endFileID int) error {
 			datas = append(datas, bytesBuffer...)
 			bytesRead = bytesRead + int64(len)
 		}
-		waitGroup.Add(1)
-		go func(writer io.WriteCloser, datas []byte) {
-			writer.Write(datas)
-			writer.Close()
-			waitGroup.Done()
-		}(writers[partitionID], datas)
+		if jobShuffleMode == MergeAndDivide {
+			waitGroup.Add(1)
+			go func(writer io.WriteCloser, datas []byte) {
+				writer.Write(datas)
+				writer.Close()
+				waitGroup.Done()
+			}(writers[partitionID], datas)
+		} else if jobShuffleMode == Merge {
+			dataWriterOnMergeMode.Write(datas)
+			currentOffset += len(datas)
+			lengths = append(lengths, currentOffset)
+		}
 		bytesWritten = bytesWritten + int64(len(datas))
 	}
 
 	waitGroup.Wait()
+
+	if jobShuffleMode == Merge {
+		dataWriterOnMergeMode.Close()
+
+		// 写出index文件
+		indexPath := j.fileSystem.Join(j.outputPath, "Shuffle_merge", "Merge", fmt.Sprintf("%v-%v.index", startFileID, endFileID))
+		indexWriter, err := j.fileSystem.OpenWriter(indexPath)
+		if err != nil {
+			return err
+		}
+
+		for _, offset := range lengths {
+			indexWriter.Write([]byte(fmt.Sprintf("%s\n", strconv.Itoa(offset))))
+		}
+
+		err = indexWriter.Close()
+		if err != nil {
+			return err
+		}
+	}
 
 	// Delete intermediate map data
 	if j.config.Cleanup {
@@ -418,8 +631,9 @@ func (j *Job) inputSplits(inputs []string, maxSplitSize int64) []inputSplit {
 // NewJob creates a new job from a Mapper and Reducer.
 func NewJob(mapper Mapper, reducer Reducer) *Job {
 	return &Job{
-		Map:    mapper,
-		Reduce: reducer,
-		config: &config{},
+		Map:                 mapper,
+		Reduce:              reducer,
+		config:              &config{},
+		mapperCompletedChan: make(chan string),
 	}
 }
